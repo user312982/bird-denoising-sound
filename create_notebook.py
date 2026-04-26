@@ -1,0 +1,247 @@
+import json
+
+notebook = {
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Training ViTVS for Bird Sound Denoising\n",
+    "This notebook contains the training pipeline for the Vision Transformer for Vocal Separation (ViTVS) model. It is designed to run on Google Colab.\n",
+    "\n",
+    "Make sure to set your Colab Runtime to **GPU** (Runtime -> Change runtime type -> Hardware accelerator -> GPU)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Clone the repository from GitHub\n",
+    "!git clone https://github.com/user312982/bird-denoising-sound.git\n",
+    "%cd bird-denoising-sound\n",
+    "\n",
+    "# Install any necessary dependencies (e.g. torchaudio if needed)\n",
+    "!pip install torchaudio"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import torch\n",
+    "import torch.nn as nn\n",
+    "import torch.optim as optim\n",
+    "from torch.utils.data import Dataset, DataLoader\n",
+    "import torchaudio\n",
+    "import os\n",
+    "\n",
+    "# Import the model components\n",
+    "from models.vitvs import ViTVS\n",
+    "\n",
+    "device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')\n",
+    "print(f\"Using device: {device}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Dataset Definition\n",
+    "Define a custom PyTorch Dataset for loading noisy bird sounds and their clean counterparts. You will need to upload your dataset to Colab or download it via script."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class BirdDenoisingDataset(Dataset):\n",
+    "    def __init__(self, noisy_dir, clean_dir, target_length=32000):\n",
+    "        \"\"\"\n",
+    "        Args:\n",
+    "            noisy_dir: Directory containing noisy audio files.\n",
+    "            clean_dir: Directory containing clean audio files.\n",
+    "            target_length: Fixed length for all audio clips (padding/truncating).\n",
+    "        \"\"\"\n",
+    "        self.noisy_dir = noisy_dir\n",
+    "        self.clean_dir = clean_dir\n",
+    "        # Assuming files have the same names in both directories\n",
+    "        self.filenames = [f for f in os.listdir(noisy_dir) if f.endswith('.wav')]\n",
+    "        self.target_length = target_length\n",
+    "        \n",
+    "    def __len__(self):\n",
+    "        return len(self.filenames)\n",
+    "    \n",
+    "    def __getitem__(self, idx):\n",
+    "        filename = self.filenames[idx]\n",
+    "        \n",
+    "        noisy_path = os.path.join(self.noisy_dir, filename)\n",
+    "        clean_path = os.path.join(self.clean_dir, filename)\n",
+    "        \n",
+    "        noisy_wav, sr = torchaudio.load(noisy_path)\n",
+    "        clean_wav, _ = torchaudio.load(clean_path)\n",
+    "        \n",
+    "        # Convert to mono if stereo\n",
+    "        if noisy_wav.shape[0] > 1:\n",
+    "            noisy_wav = torch.mean(noisy_wav, dim=0, keepdim=True)\n",
+    "        if clean_wav.shape[0] > 1:\n",
+    "            clean_wav = torch.mean(clean_wav, dim=0, keepdim=True)\n",
+    "            \n",
+    "        # Remove channel dim\n",
+    "        noisy_wav = noisy_wav.squeeze(0)\n",
+    "        clean_wav = clean_wav.squeeze(0)\n",
+    "        \n",
+    "        # Pad or truncate to target_length\n",
+    "        if noisy_wav.shape[0] > self.target_length:\n",
+    "            noisy_wav = noisy_wav[:self.target_length]\n",
+    "            clean_wav = clean_wav[:self.target_length]\n",
+    "        elif noisy_wav.shape[0] < self.target_length:\n",
+    "            pad_amount = self.target_length - noisy_wav.shape[0]\n",
+    "            noisy_wav = torch.nn.functional.pad(noisy_wav, (0, pad_amount))\n",
+    "            clean_wav = torch.nn.functional.pad(clean_wav, (0, pad_amount))\n",
+    "            \n",
+    "        return noisy_wav, clean_wav\n",
+    "\n",
+    "# --- TODO: Update these paths to your actual dataset locations in Colab ---\n",
+    "# dataset = BirdDenoisingDataset(noisy_dir='/path/to/noisy', clean_dir='/path/to/clean', target_length=32000)\n",
+    "# dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=2)\n",
+    "\n",
+    "# For demonstration, we create a dummy dataloader\n",
+    "class DummyDataset(Dataset):\n",
+    "    def __len__(self): return 100\n",
+    "    def __getitem__(self, idx):\n",
+    "        return torch.randn(32000), torch.randn(32000)\n",
+    "\n",
+    "dataloader = DataLoader(DummyDataset(), batch_size=8, shuffle=True)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Training Setup"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Initialize Model\n",
+    "# We use parameters suitable for 32000 sample audio with n_fft=1024, hop=256\n",
+    "model = ViTVS(\n",
+    "    img_size=(513, 126), # (n_fft//2 + 1, target_length // hop_length + 1)\n",
+    "    patch_size=16, \n",
+    "    embed_dim=768, \n",
+    "    depth=12, \n",
+    "    num_heads=12, \n",
+    "    num_classes=2,\n",
+    "    n_fft=1024, \n",
+    "    hop_length=256, \n",
+    "    win_length=1024\n",
+    ").to(device)\n",
+    "\n",
+    "# NLL Loss requires log probabilities, which our model computes internally or we apply log_softmax\n",
+    "criterion = nn.NLLLoss()\n",
+    "optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)\n",
+    "\n",
+    "epochs = 50"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Training Loop"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "print(\"Starting Training...\")\n",
+    "for epoch in range(epochs):\n",
+    "    model.train()\n",
+    "    running_loss = 0.0\n",
+    "    \n",
+    "    for i, (noisy_wav, clean_wav) in enumerate(dataloader):\n",
+    "        noisy_wav = noisy_wav.to(device)\n",
+    "        clean_wav = clean_wav.to(device)\n",
+    "        \n",
+    "        optimizer.zero_grad()\n",
+    "        \n",
+    "        # Forward pass\n",
+    "        # denoised_wav: the reconstructed audio (B, T)\n",
+    "        # logits: spatial patch logits (B, NumClasses, Freq, Time)\n",
+    "        denoised_wav, logits = model(noisy_wav)\n",
+    "        \n",
+    "        # Apply log softmax for NLL Loss\n",
+    "        log_probs = torch.nn.functional.log_softmax(logits, dim=1)\n",
+    "        \n",
+    "        # Generate pseudo-labels for training the mask\n",
+    "        # In practice, you might train against ideal ratio masks (IRM) or binary masks.\n",
+    "        # Here, we generate a dummy label based on energy differences (just as a placeholder).\n",
+    "        # You should replace this with your actual target mask generation logic!\n",
+    "        B, C, F, T = logits.shape\n",
+    "        target_mask = torch.randint(0, 2, (B, F, T)).to(device) # Random dummy mask\n",
+    "        \n",
+    "        # Calculate loss\n",
+    "        loss = criterion(log_probs, target_mask)\n",
+    "        \n",
+    "        # Backward pass\n",
+    "        loss.backward()\n",
+    "        optimizer.step()\n",
+    "        \n",
+    "        running_loss += loss.item()\n",
+    "        \n",
+    "    avg_loss = running_loss / len(dataloader)\n",
+    "    print(f\"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}\")\n",
+    "\n",
+    "print(\"Training Complete!\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Save the trained model\n",
+    "torch.save(model.state_dict(), 'vitvs_bird_denoising.pth')\n",
+    "print(\"Model saved to vitvs_bird_denoising.pth\")"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.8.10"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+}
+
+with open("train_vitvs_colab.ipynb", "w") as f:
+    json.dump(notebook, f, indent=1)
