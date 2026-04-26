@@ -66,11 +66,11 @@ class ViTVS(nn.Module):
             win_length=self.win_length
         )
         
-        # magnitude is (B, 1, F, T_frames)
-        B, C, F, T_frames = magnitude.shape
+        # magnitude is (B, 1, freq_bins, T_frames)
+        B, C, freq_bins, T_frames = magnitude.shape
         
         # Pad dimensions to be divisible by patch_size
-        pad_F = (self.patch_size - F % self.patch_size) % self.patch_size
+        pad_F = (self.patch_size - freq_bins % self.patch_size) % self.patch_size
         pad_T = (self.patch_size - T_frames % self.patch_size) % self.patch_size
         
         if pad_F > 0 or pad_T > 0:
@@ -99,17 +99,17 @@ class ViTVS(nn.Module):
         logits = self.decoder(x, grid_size)
         
         # The decoder output is at the patch grid resolution (grid_H, grid_W).
-        # We upsample it to match the padded magnitude spectrogram size (F + pad_F, T_frames + pad_T).
+        # We upsample it to match the padded magnitude spectrogram size (freq_bins + pad_F, T_frames + pad_T).
         logits_upsampled = F.interpolate(
             logits, 
-            size=(F + pad_F, T_frames + pad_T), 
+            size=(freq_bins + pad_F, T_frames + pad_T), 
             mode='bilinear', 
             align_corners=False
         )
         
         # Crop back to original spectrogram size if it was padded
         if pad_F > 0 or pad_T > 0:
-            logits_upsampled = logits_upsampled[:, :, :F, :T_frames]
+            logits_upsampled = logits_upsampled[:, :, :freq_bins, :T_frames]
             
         # Apply Softmax to get probabilities
         probs = F.softmax(logits_upsampled, dim=1)
