@@ -2,138 +2,84 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .audio_processing import wav_to_spectrogram, spectrogram_to_wav
 from .segmenter_vit import PatchEmbedding, TransformerEncoder, LinearDecoder
 
-class ViTVS(nn.Module):
+class ViTVS_Segmenter(nn.Module):
     """
-    Vision Transformer for Vocal Separation (ViTVS).
-    Combines STFT, Segmenter ViT backbone, and ISTFT for audio denoising.
+    Vision Transformer for Vocal Separation (ViTVS) - Image Segmentation Backbone.
+    Based on the paper "Vision Transformer Segmentation for Visual Bird Sound Denoising".
+    
+    This model takes RGB audio images (spectrograms) as input and outputs a binary
+    segmentation mask (clean audio vs noise).
     """
     def __init__(self, 
-                 img_size=(128, 128), # Default expected spectrogram size
+                 img_size=(256, 256), 
                  patch_size=16, 
+                 in_chans=3, 
                  embed_dim=768, 
                  depth=12, 
                  num_heads=12, 
-                 num_classes=2,
-                 n_fft=1024, 
-                 hop_length=256, 
-                 win_length=1024):
+                 num_classes=2):
         super().__init__()
         
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.win_length = win_length
-        self.patch_size = patch_size
-        
-        # 1. Segmenter Components
+        # 1. Image to Patches & Embedding
         self.patch_embed = PatchEmbedding(
             img_size=img_size, 
             patch_size=patch_size, 
-            in_chans=1, 
+            in_chans=in_chans, 
             embed_dim=embed_dim
         )
         
         # Absolute positional embedding
         self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.num_patches, embed_dim))
         
+        # 2. Vision Transformer Encoder (12 blocks)
         self.encoder = TransformerEncoder(
             embed_dim=embed_dim, 
             depth=depth, 
             num_heads=num_heads
         )
         
+        # 3. Linear Decoder
         self.decoder = LinearDecoder(
             embed_dim=embed_dim, 
             num_classes=num_classes
         )
 
-    def forward(self, wav):
+    def forward(self, x):
         """
         Args:
-            wav: (B, T) audio waveform
+            x: (B, 3, 256, 256) RGB audio images
             
         Returns:
-            denoised_wav: (B, T) reconstructed waveform
-            logits_upsampled: (B, num_classes, F, T_frames) for calculating NLL loss
+            logits: (B, 2, 256, 256) segmentation logits
         """
-        # 1. Audio to Spectrogram
-        magnitude, phase = wav_to_spectrogram(
-            wav, 
-            n_fft=self.n_fft, 
-            hop_length=self.hop_length, 
-            win_length=self.win_length
-        )
+        # Extract Patches
+        x_embed, grid_size = self.patch_embed(x)
         
-        # magnitude is (B, 1, freq_bins, T_frames)
-        B, C, freq_bins, T_frames = magnitude.shape
-        
-        # Pad dimensions to be divisible by patch_size
-        pad_F = (self.patch_size - freq_bins % self.patch_size) % self.patch_size
-        pad_T = (self.patch_size - T_frames % self.patch_size) % self.patch_size
-        
-        if pad_F > 0 or pad_T > 0:
-            magnitude_padded = F.pad(magnitude, (0, pad_T, 0, pad_F), mode='constant', value=0)
-        else:
-            magnitude_padded = magnitude
-            
-        # 2. Extract Patches
-        x, grid_size = self.patch_embed(magnitude_padded)
-        
-        # Add positional embedding. 
-        # Interpolate pos_embed if the input spectrogram size differs from the default img_size
-        if x.shape[1] != self.pos_embed.shape[1]:
+        # Add positional embedding
+        if x_embed.shape[1] != self.pos_embed.shape[1]:
             orig_grid = self.patch_embed.grid_size
             pe = self.pos_embed.transpose(1, 2).view(1, -1, orig_grid[0], orig_grid[1])
             pe = F.interpolate(pe, size=grid_size, mode='bilinear', align_corners=False)
             pe = pe.flatten(2).transpose(1, 2)
-            x = x + pe
+            x_embed = x_embed + pe
         else:
-            x = x + self.pos_embed
+            x_embed = x_embed + self.pos_embed
             
-        # 3. Vision Transformer Encoder
-        x = self.encoder(x)
+        # Encoder
+        encoded = self.encoder(x_embed)
         
-        # 4. Decoder
-        logits = self.decoder(x, grid_size)
+        # Decoder
+        logits = self.decoder(encoded, grid_size)
         
-        # The decoder output is at the patch grid resolution (grid_H, grid_W).
-        # We upsample it to match the padded magnitude spectrogram size (freq_bins + pad_F, T_frames + pad_T).
+        # Upsample back to original image size (256x256)
+        # because the decoder outputs at grid resolution (e.g. 16x16)
         logits_upsampled = F.interpolate(
             logits, 
-            size=(freq_bins + pad_F, T_frames + pad_T), 
+            size=x.shape[2:], 
             mode='bilinear', 
             align_corners=False
         )
         
-        # Crop back to original spectrogram size if it was padded
-        if pad_F > 0 or pad_T > 0:
-            logits_upsampled = logits_upsampled[:, :, :freq_bins, :T_frames]
-            
-        # Apply Softmax to get probabilities
-        probs = F.softmax(logits_upsampled, dim=1)
-        
-        # Class 1 is assumed to be the "Bird" / "Clean Audio" class.
-        mask = probs[:, 1:2, :, :] # (B, 1, F, T_frames)
-        
-        # Apply the predicted mask to the magnitude spectrogram
-        masked_magnitude = magnitude * mask
-        
-        # 5. Spectrogram to Audio (ISTFT)
-        denoised_wav = spectrogram_to_wav(
-            masked_magnitude, 
-            phase, 
-            n_fft=self.n_fft, 
-            hop_length=self.hop_length, 
-            win_length=self.win_length
-        )
-        
-        # Ensure denoised wav length matches input wav length exactly
-        if denoised_wav.shape[-1] > wav.shape[-1]:
-            denoised_wav = denoised_wav[..., :wav.shape[-1]]
-        elif denoised_wav.shape[-1] < wav.shape[-1]:
-            pad_val = wav.shape[-1] - denoised_wav.shape[-1]
-            denoised_wav = F.pad(denoised_wav, (0, pad_val))
-            
-        return denoised_wav, logits_upsampled
+        return logits_upsampled
